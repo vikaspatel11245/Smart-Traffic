@@ -6,7 +6,17 @@ import serial
 import serial.tools.list_ports
 
 # ─── CONFIGURATION ──────────────────────────────────────────
-CAMERA_INDEXES = [0, 1, 2]   # ← Edit after running check_cameras.py
+# IP Webcam streams via ADB port forwarding
+# Run these commands first in CMD:
+#   adb -s 10BE9330TH0029N   forward tcp:8081 tcp:8080
+#   adb -s 5a65eb4a          forward tcp:8082 tcp:8080
+#   adb -s FY6LFI95OJ954HLJ  forward tcp:8083 tcp:8080
+
+IP_CAM_URLS = [
+    "http://localhost:8081/video",
+    "http://localhost:8082/video",
+    "http://localhost:8083/video",
+]
 
 MIN_CAR_AREA  = 800
 MAX_TRACKS    = 20
@@ -25,17 +35,16 @@ AREA_MEDIUM = 15
 AREA_HIGH   = 30
 
 # ── Adaptive Signal Settings ─────────────────────────────────
-MIN_GREEN   = 5     # Minimum green time (seconds) — no lane gets less
-MAX_GREEN   = 25    # Maximum green time (seconds) — no lane holds longer
+MIN_GREEN   = 5     # Minimum green time (seconds)
+MAX_GREEN   = 25    # Maximum green time (seconds)
 YELLOW_TIME = 2     # Yellow transition time (seconds)
 
 # Pressure added per second while lane is RED, based on density
-# Higher density = pressure builds faster = gets green sooner
 PRESSURE_RATE = {
-    "LOW":    1,    # +1 pressure/sec
-    "MEDIUM": 3,    # +3 pressure/sec
-    "HIGH":   6,    # +6 pressure/sec
-    "JAM":    10,   # +10 pressure/sec — urgent
+    "LOW":    1,
+    "MEDIUM": 3,
+    "HIGH":   6,
+    "JAM":    10,
     "N/A":    1,
 }
 
@@ -109,19 +118,15 @@ class AdaptiveTrafficController(threading.Thread):
     def __init__(self, arduino, density_store):
         super().__init__(daemon=True)
         self.arduino        = arduino
-        self.density_store  = density_store   # list of 3 strings, updated by detection
+        self.density_store  = density_store
 
-        self.pressure       = [0.0, 0.0, 0.0] # pressure per lane
-        self.light_states   = ['R', 'R', 'R']  # current light state per lane
-        self.current_lane   = 0                # which lane is currently green
-        self.green_elapsed  = 0                # seconds current lane has been green
+        self.pressure       = [0.0, 0.0, 0.0]
+        self.light_states   = ['R', 'R', 'R']
+        self.current_lane   = 0
+        self.green_elapsed  = 0
         self.lock           = threading.Lock()
         self.running        = True
-
-        # Log for display
-        self.log            = []               # list of strings shown on screen
-
-    # ── Public read methods ──────────────────────────────────
+        self.log            = []
 
     def get_states(self):
         with self.lock:
@@ -143,8 +148,6 @@ class AdaptiveTrafficController(threading.Thread):
         with self.lock:
             return list(self.log)
 
-    # ── Internal helpers ─────────────────────────────────────
-
     def _set_states(self, states):
         with self.lock:
             self.light_states = list(states)
@@ -156,11 +159,10 @@ class AdaptiveTrafficController(threading.Thread):
         print(f"  {entry}")
         with self.lock:
             self.log.append(entry)
-            if len(self.log) > 20:   # keep last 20 lines
+            if len(self.log) > 20:
                 self.log.pop(0)
 
     def _pick_next_lane(self, exclude):
-        """Return lane index with highest pressure, excluding current green lane."""
         best_lane     = -1
         best_pressure = -1
         for i in range(3):
@@ -171,51 +173,41 @@ class AdaptiveTrafficController(threading.Thread):
                 best_lane     = i
         return best_lane
 
-    # ── Main control loop ────────────────────────────────────
-
     def run(self):
-        # Start: give Lane 0 green first
         self._activate_lane(0)
 
         while self.running:
-            time.sleep(1)   # tick every second
+            time.sleep(1)
 
             with self.lock:
                 lane        = self.current_lane
                 elapsed     = self.green_elapsed
                 density_now = self.density_store[lane]
 
-            # ── Build pressure on RED lanes ──────────────────
             for i in range(3):
                 if i == lane:
-                    continue   # green lane doesn't build pressure
+                    continue
                 d    = self.density_store[i]
                 rate = PRESSURE_RATE.get(d, 1)
                 with self.lock:
                     self.pressure[i] += rate
 
-            # ── Update green elapsed ─────────────────────────
             with self.lock:
                 self.green_elapsed += 1
                 elapsed = self.green_elapsed
 
-            # ── Decision logic ───────────────────────────────
-
-            # Not reached minimum green yet — hold current lane
             if elapsed < MIN_GREEN:
                 continue
 
-            # Find which other lane has highest pressure
             next_lane     = self._pick_next_lane(exclude=lane)
             next_pressure = self.pressure[next_lane] if next_lane >= 0 else 0
 
             force_switch  = elapsed >= MAX_GREEN
-            better_lane   = next_pressure > self.pressure[lane] * 1.5   # 50% more pressure
+            better_lane   = next_pressure > self.pressure[lane] * 1.5
 
             if force_switch:
                 self._log(f"Lane {lane+1} MAX GREEN reached ({elapsed}s) → switching")
                 self._switch_to(next_lane)
-
             elif better_lane:
                 self._log(
                     f"Lane {next_lane+1} pressure ({next_pressure:.0f}) "
@@ -223,28 +215,23 @@ class AdaptiveTrafficController(threading.Thread):
                 )
                 self._switch_to(next_lane)
 
-            # else: current lane still has highest pressure — stay green
-
     def _activate_lane(self, lane):
-        """Set a lane green, all others red."""
         states = ['R', 'R', 'R']
         states[lane] = 'G'
         self._set_states(states)
         with self.lock:
             self.current_lane  = lane
             self.green_elapsed = 0
-            self.pressure[lane] = 0   # reset pressure when lane gets green
+            self.pressure[lane] = 0
         self._log(
             f"Lane {lane+1} GREEN | density={self.density_store[lane]} "
             f"| pressure was {self.pressure[lane]:.0f}"
         )
 
     def _switch_to(self, next_lane):
-        """Yellow on current lane, then green on next lane."""
         with self.lock:
             lane = self.current_lane
 
-        # Yellow phase on current lane
         states = ['R', 'R', 'R']
         states[lane] = 'Y'
         self._set_states(states)
@@ -302,8 +289,8 @@ def draw_density_bar(frame, pct, x=10, y=148, bar_w=180, bar_h=12):
 LIGHT_BG    = {'G': (0,255,0),   'Y': (0,255,255), 'R': (0,0,255)}
 LIGHT_LABEL = {'G': 'GREEN',     'Y': 'YELLOW',    'R': 'RED'}
 
+
 def draw_traffic_light(frame, state, pressure=0.0, green_elapsed=0, is_active=False):
-    """Traffic light icon in top-right with pressure bar below it."""
     h, w   = frame.shape[:2]
     cx, cy = w - 42, 55
     r      = 13
@@ -318,7 +305,6 @@ def draw_traffic_light(frame, state, pressure=0.0, green_elapsed=0, is_active=Fa
                 (w - 92, cy + 48),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, lbl_col, 2)
 
-    # Pressure bar (shown only when lane is RED)
     if state == 'R':
         bar_max = 100
         bar_w   = 80
@@ -332,7 +318,6 @@ def draw_traffic_light(frame, state, pressure=0.0, green_elapsed=0, is_active=Fa
                     (bx, by + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
 
-    # Green elapsed timer
     if state == 'G':
         cv2.putText(frame, f"{green_elapsed}s / {MAX_GREEN}s",
                     (w - 90, cy + 68),
@@ -344,7 +329,6 @@ def draw_camera_overlay(frame, cam_idx, num_cars, trackers,
     count_label, count_color     = count_based_density(num_cars)
     area_label,  area_color, pct = area_based_density(trackers)
 
-    # Semi-transparent background
     overlay = frame.copy()
     cv2.rectangle(overlay, (5, 5), (310, 170), (0,0,0), -1)
     cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
@@ -356,7 +340,6 @@ def draw_camera_overlay(frame, cam_idx, num_cars, trackers,
     cv2.putText(frame, f"Area    : {area_label}  ({pct:.1f}%)",
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, area_color, 1)
 
-    # Pressure rate info
     rate = PRESSURE_RATE.get(count_label, 1)
     cv2.putText(frame, f"Pressure rate: +{rate}/sec",
                 (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180,180,180), 1)
@@ -370,11 +353,15 @@ def draw_camera_overlay(frame, cam_idx, num_cars, trackers,
     return count_label, area_label, pct
 
 
-# ─── Camera class ────────────────────────────────────────────
+# ─── IP Camera class (replaces USBCamera) ────────────────────
 
 class USBCamera:
-    def __init__(self, device_index):
-        self.device_index = device_index
+    """
+    Streams from IP Webcam app via ADB-forwarded HTTP stream.
+    URL format: http://localhost:<port>/video
+    """
+    def __init__(self, url):
+        self.url     = url
         self.cap     = None
         self.frame   = None
         self.lock    = threading.Lock()
@@ -384,16 +371,17 @@ class USBCamera:
         self.thread.start()
 
     def _open(self):
-        for _ in range(5):
-            self.cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+        for attempt in range(5):
+            self.cap = cv2.VideoCapture(self.url)
             if self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
                 self.cap.set(cv2.CAP_PROP_FPS, 20)
-                print(f"  ✅ Camera {self.device_index} opened")
+                print(f"  ✅ IP Camera opened: {self.url}")
                 return True
-            time.sleep(0.5)
-        print(f"  ❌ Camera {self.device_index} failed")
+            print(f"  ⏳ Retrying {self.url} (attempt {attempt+1}/5)...")
+            time.sleep(1)
+        print(f"  ❌ Failed to open: {self.url}")
         return False
 
     def _reader(self):
@@ -405,11 +393,13 @@ class USBCamera:
                     with self.lock:
                         self.frame = frame
                 else:
+                    print(f"  ⚠️  Lost stream {self.url}, reconnecting...")
                     self.cap.release()
+                    time.sleep(1)
                     self._open()
             else:
+                time.sleep(1)
                 self._open()
-            time.sleep(0.05)
         if self.cap:
             self.cap.release()
 
@@ -499,7 +489,7 @@ def update_trackers(trackers, current_rects):
     return new_trackers[:MAX_TRACKS]
 
 
-# ─── Log panel (right side of combined view) ─────────────────
+# ─── Log panel ───────────────────────────────────────────────
 
 def draw_log_panel(log_lines, height, width=320):
     panel = np.zeros((height, width, 3), dtype=np.uint8)
@@ -509,8 +499,7 @@ def draw_log_panel(log_lines, height, width=320):
     cv2.line(panel, (5, 28), (width-5, 28), (80,80,80), 1)
 
     y = 48
-    for line in log_lines[-14:]:    # show last 14 lines
-        # colour-code by lane mentioned
+    for line in log_lines[-14:]:
         col = (180,180,180)
         if "Lane 1" in line: col = (100,255,100)
         if "Lane 2" in line: col = (100,200,255)
@@ -526,22 +515,27 @@ def draw_log_panel(log_lines, height, width=320):
 
 # ─── Main ────────────────────────────────────────────────────
 
-print("\n── Smart Adaptive Traffic Monitor ──────────")
-print("── Connecting Arduino ───────────────────────")
+print("\n── Smart Adaptive Traffic Monitor (IP Webcam via ADB) ──")
+print("── Connecting Arduino ───────────────────────────────────")
 arduino = connect_arduino()
 
-print("\n── Opening USB Cameras ──────────────────────")
-cameras = [USBCamera(idx) for idx in CAMERA_INDEXES]
+print("\n── Opening IP Cameras ───────────────────────────────────")
+print("   Make sure you ran:")
+print("   adb -s 10BE9330TH0029N   forward tcp:8081 tcp:8080")
+print("   adb -s 5a65eb4a          forward tcp:8082 tcp:8080")
+print("   adb -s FY6LFI95OJ954HLJ  forward tcp:8083 tcp:8080\n")
+
+cameras = [USBCamera(url) for url in IP_CAM_URLS]
 camera_trackers = [[] for _ in cameras]
 
 # Shared density store — written by detection, read by controller
 density_store = ["LOW"] * 3
 
-print("\n── Starting Adaptive Controller ─────────────")
+print("\n── Starting Adaptive Controller ─────────────────────────")
 controller = AdaptiveTrafficController(arduino, density_store)
 controller.start()
 
-print("── Starting Detection Loop ──────────────────")
+print("── Starting Detection Loop ──────────────────────────────")
 print("   Press 'q' to quit\n")
 
 while True:
@@ -561,6 +555,8 @@ while True:
             ph = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
             cv2.putText(ph, f"Cam {cam_idx+1} — No Signal",
                         (80,240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+            cv2.putText(ph, f"Check: adb forward tcp:{8081+cam_idx} tcp:8080",
+                        (20, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 1)
             frames.append(ph)
             cam_summaries.append((cam_idx, 0, "N/A", "N/A", 0.0))
             continue
@@ -571,10 +567,8 @@ while True:
         num_cars    = len(trackers)
         total_cars += num_cars
 
-        # Update shared density (controller reads this every second)
         density_store[cam_idx], _ = count_based_density(num_cars)
 
-        # Draw detections
         for rect in raw_rects[:10]:
             x,y,w,h,_ = rect
             cv2.rectangle(frame, (x,y), (x+w,y+h), (255,0,0), 1)
@@ -583,9 +577,9 @@ while True:
             cv2.putText(frame, f"#{tid}", (x,y-8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0,255,0), 2)
 
-        ls      = light_states[cam_idx] if cam_idx < len(light_states) else 'R'
-        pr      = pressures[cam_idx]    if cam_idx < len(pressures)    else 0.0
-        ge      = green_elapsed         if cam_idx == active_lane       else 0
+        ls = light_states[cam_idx] if cam_idx < len(light_states) else 'R'
+        pr = pressures[cam_idx]    if cam_idx < len(pressures)    else 0.0
+        ge = green_elapsed         if cam_idx == active_lane       else 0
 
         count_lbl, area_lbl, pct = draw_camera_overlay(
             frame, cam_idx, num_cars, trackers, ls, pr, ge)
@@ -598,11 +592,9 @@ while True:
     resized = [cv2.resize(f, (int(f.shape[1]*H/f.shape[0]), H)) for f in frames]
     cam_row = np.hstack(resized)
 
-    # Log panel on the right
     log_panel = draw_log_panel(controller.get_log(), H, width=360)
     combined  = np.hstack([cam_row, log_panel])
 
-    # Top bar
     avg = total_cars / max(len(cam_summaries), 1)
     if avg <= COUNT_LOW:       overall,ov_col = "LOW",    (0,255,0)
     elif avg <= COUNT_MEDIUM:  overall,ov_col = "MEDIUM", (0,255,255)
@@ -619,7 +611,6 @@ while True:
 
     display = np.vstack([header, combined])
 
-    # Bottom strip
     strip_h = 24
     strip   = np.zeros((strip_h, display.shape[1], 3), dtype=np.uint8)
     for cam_idx, num_cars, count_lbl, area_lbl, pct in cam_summaries:
